@@ -6,8 +6,15 @@ import logging.handlers
 from dotenv import load_dotenv
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+import uvicorn
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.requests import Request
 
 import chromadb
 import chromadb.utils.embedding_functions as embedding_functions
@@ -435,66 +442,82 @@ def delete_memory(memory_id: str, collection_name: str = "default_collection") -
         return f"Error deleting memory {memory_id}: {str(e)}"
 
 
-@mcp.tool()
-def get_collection_stats(collection_name: str = "default_collection") -> Dict[str, Any]:
-    """Get statistics and information about a collection.
 
-    This tool provides detailed information about a collection including the number
-    of memories stored, metadata, and other statistics.
+## Using streamable-http transport for MCP server
+# Initialize ChromaDB when the module is imported
+# if __name__ == "__main__":
+#     logger.info("Starting ChromaDB MCP Server...")
+#     logger.info(f"Log level: {LOG_LEVEL}")
+#     logger.info(f"Log file: {LOG_FILE}")
+#     logger.info(f"Port: {PORT}")
+
+#     try:
+#         initialize_chromadb()
+#         logger.info(f"ChromaDB MCP Server starting on port {PORT}")
+#         logger.info(f"Available collections: {list(collections.keys())}")
+#         mcp.run(transport="streamable-http")
+#     except Exception as e:
+#         logger.critical(f"Failed to start server: {str(e)}", exc_info=True)
+#         raise
+
+
+## Using sse transport for MCP server
+def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
+    """
+    Constructs a Starlette app with SSE and message endpoints.
 
     Args:
-        collection_name: Name of the collection to get stats for. Defaults to "default_collection".
+        mcp_server (Server): The core MCP server instance.
+        debug (bool): Enable debug mode for verbose logs.
 
     Returns:
-        Dictionary containing:
-        - name: Collection name
-        - count: Number of memories in the collection
-        - metadata: Collection metadata including description
+        Starlette: The full Starlette app with routes.
     """
-    logger.info(f"Getting stats for collection: '{collection_name}'")
+    # Create SSE transport handler to manage long-lived SSE connections
+    sse = SseServerTransport("/messages/")
 
-    if client is None:
-        logger.info("Client not initialized, auto-initializing...")
-        initialize_chromadb()
+    # This function is triggered when a client connects to `/sse`
+    async def handle_sse(request: Request) -> None:
+        """
+        Handles a new SSE client connection and links it to the MCP server.
+        """
+        # Open an SSE connection, then hand off read/write streams to MCP
+        async with sse.connect_sse(
+            request.scope,
+            request.receive,
+            request._send,  # Low-level send function provided by Starlette
+        ) as (read_stream, write_stream):
+            await mcp_server.run(
+                read_stream,
+                write_stream,
+                mcp_server.create_initialization_options(),
+            )
 
-    if collection_name not in _get_collections():
-        logger.error(
-            f"Unknown collection: {collection_name}. Available: {list(collections.keys())}"
-        )
-        raise ValueError(
-            f"Unknown collection: {collection_name}. Available: {list(collections.keys())}"
-        )
-
-    try:
-        collection = collections[collection_name]
-        stats = {
-            "name": collection_name,
-            "count": collection.count(),
-            "metadata": collection.metadata if hasattr(collection, "metadata") else {},
-        }
-        logger.info(f"Collection '{collection_name}' stats: {stats['count']} documents")
-        return stats
-
-    except Exception as e:
-        logger.error(
-            f"Failed to get stats for collection '{collection_name}': {str(e)}",
-            exc_info=True,
-        )
-        raise
+    # Return the Starlette app with configured endpoints
+    return Starlette(
+        debug=debug,
+        routes=[
+            Route("/sse", endpoint=handle_sse),  # For initiating SSE connection
+            Mount(
+                "/messages/", app=sse.handle_post_message
+            ),  # For POST-based communication
+        ],
+    )
 
 
-# Initialize ChromaDB when the module is imported
 if __name__ == "__main__":
-    logger.info("Starting ChromaDB MCP Server...")
-    logger.info(f"Log level: {LOG_LEVEL}")
-    logger.info(f"Log file: {LOG_FILE}")
-    logger.info(f"Port: {PORT}")
+    mcp_server = mcp._mcp_server
 
-    try:
-        initialize_chromadb()
-        logger.info(f"ChromaDB MCP Server starting on port {PORT}")
-        logger.info(f"Available collections: {list(collections.keys())}")
-        mcp.run(transport="streamable-http")
-    except Exception as e:
-        logger.critical(f"Failed to start server: {str(e)}", exc_info=True)
-        raise
+    # Command-line arguments for host/port control
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run MCP SSE-based server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=PORT, help="Port to listen on")
+    args = parser.parse_args()
+
+    # Build the Starlette app with debug mode enabled
+    starlette_app = create_starlette_app(mcp_server, debug=True)
+
+    # Launch the server using Uvicorn
+    uvicorn.run(starlette_app, host=args.host, port=args.port)
