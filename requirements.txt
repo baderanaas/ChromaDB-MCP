@@ -1,3 +1,5 @@
 mcp
 chromadb
 openai
+google-generativeai
+google-genai
